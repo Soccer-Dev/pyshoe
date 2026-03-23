@@ -1,10 +1,16 @@
 import numpy as np
 from numpy import linalg as LA
 from ins_tools.geometry_helpers import *
-import ins_tools.SVM as SVM
+try:
+    import ins_tools.SVM as SVM
+except ImportError:
+    SVM = None
 import copy
 import csv
-from liegroups import SO3
+try:
+    from liegroups import SO3
+except ImportError:
+    SO3 = None
     
 #rotates a (Nx3) trajectory traj1 to align with another (Nx3)trajectory traj2
 def align_plots(traj1,traj2, dist=0.8, use_totstat=False, align_idx=None):
@@ -163,6 +169,8 @@ def rotate_attitude_to_gt(est_rpy, gt_rpy):
     return est_rpy
 
 def compute_attitude_error(est_rpy, gt_rpy):
+    if SO3 is None:
+        raise ImportError("liegroups is required for compute_attitude_error")
     r_gt = gt_rpy[0,:]
     r_est = est_rpy[0,:]
     

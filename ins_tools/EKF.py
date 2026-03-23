@@ -1,10 +1,19 @@
 import numpy as np
 from numpy import linalg as LA
-import ins_tools.LSTM as lstm #remove if there is no pytorch installation
-import ins_tools.SVM as SVM #remove if there is no sci-kit-learn installation
+try:
+    import ins_tools.LSTM as lstm #remove if there is no pytorch installation
+except ImportError:
+    lstm = None
+try:
+    import ins_tools.SVM as SVM #remove if there is no sci-kit-learn installation
+except ImportError:
+    SVM = None
 from ins_tools.util import *
 from ins_tools.geometry_helpers import quat2mat, mat2quat, euler2quat, quat2euler
-from sklearn.externals import joblib
+try:
+    from sklearn.externals import joblib
+except ImportError:
+    import joblib
 import sys
 sys.path.append('../')
 
@@ -95,7 +104,7 @@ class Localizer():
 
     def SHOE(self, W=5):
         imudata = self.imudata
-        T = np.zeros(np.int(np.floor(imudata.shape[0]/W)+1))
+        T = np.zeros(int(np.floor(imudata.shape[0]/W)+1))
         zupt = np.zeros(imudata.shape[0])
         a = np.zeros((1,3))
         w = np.zeros((1,3))
@@ -119,7 +128,7 @@ class Localizer():
         
     def ARED(self, W=5): #angular rate energy detector
         imudata = self.imudata
-        T = np.zeros(np.int(np.floor(imudata.shape[0]/W)+1))
+        T = np.zeros(int(np.floor(imudata.shape[0]/W)+1))
         zupt = np.zeros(imudata.shape[0])
         w = np.zeros((1,3))
         gyro = imudata[:,3:6]
@@ -136,7 +145,7 @@ class Localizer():
         
     def AMVD(self, W=5): #angular rate energy detector
         imudata = self.imudata
-        T = np.zeros(np.int(np.floor(imudata.shape[0]/W)+1))
+        T = np.zeros(int(np.floor(imudata.shape[0]/W)+1))
         zupt = np.zeros(imudata.shape[0])
         w = np.zeros((1,3))
         acc = imudata[:,0:3]
@@ -190,11 +199,15 @@ class Localizer():
         return norm_vel[:,0]
     
     def LSTM(self):
+        if lstm is None:
+            raise ImportError("torch is required for the LSTM detector")
         lstm_detector = lstm.LSTM()
         zv_lstm = lstm_detector(self.imudata)
         return zv_lstm
     
     def adaptive_zv(self, W=5, G=[1e7, 35e7]): #specify [G_walk, G_run]
+        if SVM is None:
+            raise ImportError("scikit-learn is required for the adaptive detector")
         G_walk = G[0]
         G_run = G[1]
         if len(G) == 3:
@@ -210,7 +223,7 @@ class Localizer():
         G = np.zeros(imu.shape[0])
     
         for i in np.arange(0,imu.shape[0]-(sample_len+1),offset):
-            i = np.int(i)
+            i = int(i)
             G[i:i+sample_len] = motion[c]
             c+=1
             
