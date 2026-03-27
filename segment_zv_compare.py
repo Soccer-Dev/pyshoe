@@ -27,6 +27,7 @@ VERTICAL_AXIS = 1
 IMU_TO_OPTI_AXIS_ORDER = (0, 2, 1)
 IMU_TO_OPTI_AXIS_SIGN = (1.0, 1.0, 1.0)
 SUPPORTED_ACC_SOURCES = {"raw_acc", "linear_acc"}
+SUPPORTED_HORIZONTAL_MIRROR_MODES = {"none", "flip_x", "flip_z", "auto"}
 
 
 def make_segment_name(segment_id: int, direction_label: str) -> str:
@@ -102,45 +103,89 @@ def _first_reach_index(traj_horiz: np.ndarray, dist: float) -> int:
     return int(min(traj_horiz.shape[0] - 1, 300))
 
 
-def _safe_align_plots(traj_est: np.ndarray, traj_gt: np.ndarray, dist: float = 0.8) -> tuple[np.ndarray, np.ndarray]:
+def _rotation_from_first_motion(est_h: np.ndarray, gt_h: np.ndarray, dist: float) -> np.ndarray:
+    est_idx = _first_reach_index(est_h, dist=dist)
+    vec_est = est_h[est_idx]
+
+    if np.abs(gt_h.shape[0] - est_h.shape[0]) < 5:
+        gt_idx = min(est_idx, gt_h.shape[0] - 1)
+    else:
+        gt_idx = _first_reach_index(gt_h, dist=dist)
+    vec_gt = gt_h[gt_idx]
+
+    est_norm = np.linalg.norm(vec_est)
+    gt_norm = np.linalg.norm(vec_gt)
+    if est_norm < 1e-8 or gt_norm < 1e-8:
+        raise ValueError("trajectory too short for horizontal alignment")
+
+    signed_cross = vec_est[0] * vec_gt[1] - vec_est[1] * vec_gt[0]
+    angle = float(np.arctan2(signed_cross, np.dot(vec_est, vec_gt)))
+    return np.array(
+        [[np.cos(angle), -np.sin(angle)], [np.sin(angle), np.cos(angle)]],
+        dtype=float,
+    )
+
+
+def _mirror_modes_to_try(horizontal_mirror_mode: str) -> list[str]:
+    if horizontal_mirror_mode not in SUPPORTED_HORIZONTAL_MIRROR_MODES:
+        raise ValueError(
+            f"horizontal_mirror_mode must be one of {sorted(SUPPORTED_HORIZONTAL_MIRROR_MODES)}"
+        )
+    if horizontal_mirror_mode == "auto":
+        return ["none", "flip_x", "flip_z"]
+    return [horizontal_mirror_mode]
+
+
+def _apply_horizontal_mirror(est_h: np.ndarray, mirror_mode: str) -> np.ndarray:
+    est_h = np.asarray(est_h, dtype=float).copy()
+    if mirror_mode == "none":
+        return est_h
+    if mirror_mode == "flip_x":
+        est_h[:, 0] *= -1.0
+        return est_h
+    if mirror_mode == "flip_z":
+        est_h[:, 1] *= -1.0
+        return est_h
+    raise ValueError(f"Unsupported mirror_mode: {mirror_mode}")
+
+
+def _safe_align_plots(
+    traj_est: np.ndarray,
+    traj_gt: np.ndarray,
+    dist: float = 0.8,
+    horizontal_mirror_mode: str = "none",
+) -> tuple[np.ndarray, np.ndarray, str]:
     traj_est = np.asarray(traj_est, dtype=float)
     traj_gt = np.asarray(traj_gt, dtype=float)
     traj_est = traj_est - traj_est[0]
     traj_gt = traj_gt - traj_gt[0]
 
     try:
-        est_h = traj_est[:, HORIZONTAL_AXES]
         gt_h = traj_gt[:, HORIZONTAL_AXES]
+        best_est_aligned = None
+        best_rmse = np.inf
+        best_mirror_mode = "none"
 
-        est_idx = _first_reach_index(est_h, dist=dist)
-        vec_est = est_h[est_idx]
+        for mirror_mode in _mirror_modes_to_try(horizontal_mirror_mode):
+            est_candidate = traj_est.copy()
+            est_h = _apply_horizontal_mirror(est_candidate[:, HORIZONTAL_AXES], mirror_mode)
+            rotation = _rotation_from_first_motion(est_h, gt_h, dist=dist)
+            est_candidate[:, HORIZONTAL_AXES] = est_h @ rotation.T
 
-        if np.abs(traj_gt.shape[0] - traj_est.shape[0]) < 5:
-            gt_idx = min(est_idx, gt_h.shape[0] - 1)
-        else:
-            gt_idx = _first_reach_index(gt_h, dist=dist)
-        vec_gt = gt_h[gt_idx]
+            if not np.isfinite(est_candidate).all():
+                continue
 
-        est_norm = np.linalg.norm(vec_est)
-        gt_norm = np.linalg.norm(vec_gt)
-        if est_norm < 1e-8 or gt_norm < 1e-8:
-            raise ValueError("trajectory too short for horizontal alignment")
+            rmse = _average_rmse(est_candidate, traj_gt, dims=2)
+            if rmse < best_rmse:
+                best_rmse = rmse
+                best_est_aligned = est_candidate
+                best_mirror_mode = mirror_mode
 
-        signed_cross = vec_est[0] * vec_gt[1] - vec_est[1] * vec_gt[0]
-        angle = float(np.arctan2(signed_cross, np.dot(vec_est, vec_gt)))
-        rotation = np.array(
-            [[np.cos(angle), -np.sin(angle)], [np.sin(angle), np.cos(angle)]],
-            dtype=float,
-        )
-
-        est_aligned = traj_est.copy()
-        est_aligned[:, HORIZONTAL_AXES] = est_h @ rotation.T
-
-        if not np.isfinite(est_aligned).all() or not np.isfinite(traj_gt).all():
+        if best_est_aligned is None or not np.isfinite(traj_gt).all():
             raise ValueError("alignment produced non-finite values")
-        return est_aligned, traj_gt
+        return best_est_aligned, traj_gt, best_mirror_mode
     except Exception:
-        return traj_est, traj_gt
+        return traj_est, traj_gt, "none"
 
 
 def cumulative_distance(traj: np.ndarray, dims: int = 2) -> np.ndarray:
@@ -272,6 +317,7 @@ def analyze_segment(
     attitude_source: str = "gyro_integrated",
     quat_mode: str = "direct",
     acc_source: str = "raw_acc",
+    horizontal_mirror_mode: str = "none",
 ) -> tuple[dict, pd.DataFrame]:
     imu_df, opti_df, imu_time, gt_xyz_m = load_segment_pair(
         imu_path=imu_path,
@@ -325,7 +371,12 @@ def analyze_segment(
     else:
         raise ValueError("attitude_source must be 'gyro_integrated' or 'measured_quat'")
 
-    est_aligned_m, gt_aligned_m = _safe_align_plots(est_xyz_m, gt_xyz_m, dist=align_dist_m)
+    est_aligned_m, gt_aligned_m, applied_horizontal_mirror = _safe_align_plots(
+        est_xyz_m,
+        gt_xyz_m,
+        dist=align_dist_m,
+        horizontal_mirror_mode=horizontal_mirror_mode,
+    )
 
     opti_time = opti_df[time_column].to_numpy(dtype=float)
     opti_speed = (
@@ -366,6 +417,8 @@ def analyze_segment(
         "attitude_source": attitude_source,
         "quat_mode": quat_mode if attitude_source == "measured_quat" else "",
         "acc_source": acc_source,
+        "horizontal_mirror_mode": horizontal_mirror_mode,
+        "applied_horizontal_mirror": applied_horizontal_mirror,
         "num_samples": int(len(imu_df)),
         "duration_s": float(imu_time_rel[-1]) if len(imu_time_rel) else 0.0,
         "zv_count": int(np.sum(zv)),
@@ -432,6 +485,7 @@ def sweep_all_segments(
     attitude_source: str = "gyro_integrated",
     quat_mode: str = "direct",
     acc_source: str = "raw_acc",
+    horizontal_mirror_mode: str = "none",
 ) -> pd.DataFrame:
     rows = []
     for segment in segment_table.itertuples(index=False):
@@ -452,6 +506,7 @@ def sweep_all_segments(
                     attitude_source=attitude_source,
                     quat_mode=quat_mode,
                     acc_source=acc_source,
+                    horizontal_mirror_mode=horizontal_mirror_mode,
                 )
                 rows.append(metrics)
     metrics_df = pd.DataFrame(rows)
@@ -518,6 +573,7 @@ def export_best_run_details(
     attitude_source: str = "gyro_integrated",
     quat_mode: str = "direct",
     acc_source: str = "raw_acc",
+    horizontal_mirror_mode: str = "none",
 ) -> list[Path]:
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -542,6 +598,7 @@ def export_best_run_details(
             attitude_source=attitude_source,
             quat_mode=quat_mode,
             acc_source=acc_source,
+            horizontal_mirror_mode=horizontal_mirror_mode,
         )
         suffix = _source_tag(attitude_source=attitude_source, acc_source=acc_source)
         output_path = output_dir / f"{row.segment_name}_{row.detector}_{suffix}_detail.csv"
@@ -591,6 +648,7 @@ def plot_all_segment_overlays(
     attitude_source: str = "gyro_integrated",
     quat_mode: str = "direct",
     acc_source: str = "raw_acc",
+    horizontal_mirror_mode: str = "none",
 ) -> tuple[plt.Figure, np.ndarray]:
     best_df = best_df.sort_values("segment_id")
     rows = ceil(len(best_df) / cols)
@@ -615,6 +673,7 @@ def plot_all_segment_overlays(
             attitude_source=attitude_source,
             quat_mode=quat_mode,
             acc_source=acc_source,
+            horizontal_mirror_mode=horizontal_mirror_mode,
         )
         ax.plot(detail_df["gt_x_m"], detail_df["gt_z_m"], label="OptiTrack", linewidth=2.0)
         ax.plot(
